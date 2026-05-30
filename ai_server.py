@@ -155,7 +155,10 @@ def clean_audio_api():
             print(f"❌ Lỗi trong quá trình xử lý: {e}")
             return jsonify({"error": str(e)}), 500
 
-# Chạy Server ở cổng 8000
+# Chạy Server
 if __name__ == '__main__':
-    print("🚀 Server AI đang chạy tại: http://localhost:8000")
-    app.run(host='0.0.0.0', port=8000, debug=True)
+    # Render sẽ cấp một cổng động thông qua biến môi trường PORT, 
+    # nếu không có (chạy local) thì mặc định dùng 8000
+    port = int(os.environ.get("PORT", 8000))
+    print(f"🚀 Server AI đang chạy tại cổng: {port}")
+    app.run(host='0.0.0.0', port=port, debug=False)
