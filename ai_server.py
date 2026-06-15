@@ -45,22 +45,33 @@ except Exception as e:
 # ==========================================
 # 3. HÀM XỬ LÝ ÂM THANH CỐT LÕI
 # ==========================================
+# Tham số STFT — phải nhất quán giữa forward và inverse transform
+N_FFT = 256          # power-of-2 → FFT nhanh; 256//2+1 = 129 freq bins
+HOP_LENGTH = 64      # = N_FFT//4 → overlap 75%, giúp istft mượt mà
+MODEL_FREQ_BINS = 128  # số freq bins model mong đợi
+
 def process_audio(input_path, output_path):
     y, sr = librosa.load(input_path, sr=16000)
-    stft = librosa.stft(y, n_fft=254, hop_length=128)
-    magnitude = np.abs(stft)
+
+    # --- STFT (forward) ---
+    stft = librosa.stft(y, n_fft=N_FFT, hop_length=HOP_LENGTH, window='hann')
+    magnitude = np.abs(stft)   # shape: (N_FFT//2+1, T) = (129, T)
     phase = np.exp(1.j * np.angle(stft))
 
-    freq_bins = magnitude.shape[0]
+    # Cắt freq dimension về MODEL_FREQ_BINS để khớp với input model
+    magnitude_model = magnitude[:MODEL_FREQ_BINS, :]   # (128, T)
+    phase_model     = phase[:MODEL_FREQ_BINS, :]       # (128, T)
+    freq_bins = MODEL_FREQ_BINS
 
-    log_spectrogram = librosa.amplitude_to_db(magnitude, ref=np.max)
+    # --- Chuẩn hoá log-spectrogram ---
+    log_spectrogram = librosa.amplitude_to_db(magnitude_model, ref=np.max)
     min_val = np.min(log_spectrogram)
     max_val = np.max(log_spectrogram)
     norm_spectrogram = (log_spectrogram - min_val) / (max_val - min_val + 1e-8)
 
     time_frames = norm_spectrogram.shape[1]
     window_size = 128
-    step_size = 32
+    step_size = 64   # overlap 50% → đủ mượt, ít chunk hơn
 
     if time_frames < window_size:
         num_chunks = 1
@@ -71,53 +82,68 @@ def process_audio(input_path, output_path):
 
     pad_len = padded_time_frames - time_frames
     if pad_len > 0:
-        norm_spectrogram = np.pad(norm_spectrogram, ((0, 0), (0, pad_len)), mode='constant')
+        norm_spectrogram = np.pad(norm_spectrogram, ((0, 0), (0, pad_len)), mode='edge')
+
+    # --- Tạo Hann window trên chiều time để crossfade khi overlap-add ---
+    hann_win = np.hanning(window_size)  # shape: (128,)
 
     chunks = []
     start_indices = []
-
     for i in range(num_chunks):
         start = i * step_size
         chunk = norm_spectrogram[:, start: start + window_size]
         chunks.append(chunk)
         start_indices.append(start)
 
-    X_input = np.array(chunks)[..., np.newaxis]
+    X_input = np.array(chunks)[..., np.newaxis]  # (N, 128, 128, 1)
 
-    del chunks, norm_spectrogram, log_spectrogram, magnitude
+    del chunks, norm_spectrogram, log_spectrogram, magnitude_model
     gc.collect()
 
-    # Xử lý theo lô (batch_size) để chống tràn RAM
+    # --- Chạy model ---
     X_cleaned = ai_model.predict(X_input, batch_size=8, verbose=0)
-    X_cleaned = np.squeeze(X_cleaned, axis=-1)
+    X_cleaned = np.squeeze(X_cleaned, axis=-1)  # (N, 128, 128)
 
     del X_input
     gc.collect()
 
-    cleaned_padded = np.zeros((freq_bins, padded_time_frames))
-    overlap_count = np.zeros((freq_bins, padded_time_frames))
+    # --- Overlap-add có crossfade (weighted OLA) ---
+    cleaned_padded  = np.zeros((freq_bins, padded_time_frames))
+    weight_padded   = np.zeros(padded_time_frames)   # chỉ cần 1D vì weight không phụ thuộc freq
 
     for i in range(num_chunks):
         start = start_indices[i]
-        cleaned_padded[:, start: start + window_size] += X_cleaned[i]
-        overlap_count[:, start: start + window_size] += 1
+        # Áp Hann window theo chiều time trước khi cộng
+        cleaned_padded[:, start: start + window_size] += X_cleaned[i] * hann_win[np.newaxis, :]
+        weight_padded[start: start + window_size]     += hann_win
 
-    cleaned_padded /= np.maximum(overlap_count, 1)
+    # Chia cho tổng trọng số (tránh chia cho 0 ở vùng biên)
+    weight_padded = np.maximum(weight_padded, 1e-8)
+    cleaned_padded /= weight_padded[np.newaxis, :]
     cleaned_spectrogram_norm = cleaned_padded[:, :time_frames]
 
+    # --- Denormalise → biên độ ---
     cleaned_log_spectrogram = cleaned_spectrogram_norm * (max_val - min_val + 1e-8) + min_val
-    cleaned_magnitude = librosa.db_to_amplitude(cleaned_log_spectrogram)
-    cleaned_stft = cleaned_magnitude * phase
+    cleaned_magnitude = librosa.db_to_amplitude(cleaned_log_spectrogram)  # (128, T)
 
-    y_clean = librosa.istft(cleaned_stft, hop_length=128, length=len(y))
+    # Ghép lại với phần freq bins còn lại của stft gốc (nếu có) để istft đủ kích thước
+    # magnitude gốc có shape (129, T); ta chỉ xử lý 128 bin đầu, bin 129 giữ nguyên
+    full_magnitude = np.copy(magnitude[:, :time_frames])
+    full_magnitude[:MODEL_FREQ_BINS, :] = cleaned_magnitude
+    cleaned_stft = full_magnitude * phase[:, :time_frames]
 
+    # --- Inverse STFT ---
+    y_clean = librosa.istft(cleaned_stft, hop_length=HOP_LENGTH, win_length=N_FFT,
+                            window='hann', length=len(y))
+
+    # Normalise biên độ về 0.8 để tránh clipping
     max_amplitude = np.max(np.abs(y_clean))
     if max_amplitude > 0:
         y_clean = y_clean * (0.8 / max_amplitude)
 
     sf.write(output_path, y_clean, sr)
 
-    del y, stft, phase, cleaned_padded, cleaned_stft, X_cleaned
+    del y, stft, phase, full_magnitude, cleaned_padded, cleaned_stft, X_cleaned
     gc.collect()
 
 # ==========================================
