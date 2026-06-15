@@ -5,3 +5,4 @@ librosa
 soundfile
 numpy
 pydub==0.25.1
+gunicorn==21.2.0
