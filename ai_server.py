@@ -2,6 +2,7 @@ import os
 import tempfile
 import io
 import gc
+import shutil
 import numpy as np
 import librosa
 import soundfile as sf
@@ -10,8 +11,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-# 1. TỐI ƯU HÓA PHẦN CỨNG CHO CLOUD MIỄN PHÍ
-# Ép TensorFlow chỉ dùng 1 luồng, hạn chế tranh giành CPU và cấm spam log
+# 1. TỐI ƯU HÓA PHẦN CỨNG
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['TF_NUM_INTRAOP_THREADS'] = '1'
@@ -27,23 +27,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 2. TẢI MÔ HÌNH TOÀN CỤC (Tránh lỗi phân mảnh bộ nhớ khi load nhiều lần)
+# 2. TẢI MÔ HÌNH TOÀN CỤC VÀO RAM
 import tensorflow as tf
-tf.config.set_visible_devices([], 'GPU') # Tắt GPU hoàn toàn
+tf.config.set_visible_devices([], 'GPU')
 
 MODEL_PATH = os.path.join(os.path.dirname(__file__), 'model', 'denoise_softmask_best.h5')
 try:
-    print("⏳ Đang tải mô hình AI vào RAM...")
+    # flush=True ép log hiển thị ngay lập tức
+    print("⏳ Đang tải mô hình AI vào RAM...", flush=True)
     ai_model = tf.keras.models.load_model(MODEL_PATH, compile=False)
-    # Khởi động nóng (Warm-up) để giãn nở RAM trước
     ai_model.predict(np.zeros((1, 128, 128, 1), dtype=np.float32), verbose=0)
-    print("✅ Mô hình đã sẵn sàng!")
+    print("✅ Mô hình đã sẵn sàng!", flush=True)
 except Exception as e:
-    print(f"❌ Lỗi tải mô hình: {e}")
+    print(f"❌ Lỗi tải mô hình: {e}", flush=True)
     ai_model = None
 
 # ==========================================
-# 3. HÀM XỬ LÝ ÂM THANH CỐT LÕI (TIẾT KIỆM RAM)
+# 3. HÀM XỬ LÝ ÂM THANH CỐT LÕI
 # ==========================================
 def process_audio(input_path, output_path):
     y, sr = librosa.load(input_path, sr=16000)
@@ -84,11 +84,10 @@ def process_audio(input_path, output_path):
 
     X_input = np.array(chunks)[..., np.newaxis]
 
-    # GIẢI CỨU RAM BƯỚC 1: Xóa ngay các biến không dùng nữa
     del chunks, norm_spectrogram, log_spectrogram, magnitude
     gc.collect()
 
-    # GIẢI CỨU RAM BƯỚC 2: Thêm batch_size=8 để AI ăn từ từ, không bị nghẹn!
+    # Xử lý theo lô (batch_size) để chống tràn RAM
     X_cleaned = ai_model.predict(X_input, batch_size=8, verbose=0)
     X_cleaned = np.squeeze(X_cleaned, axis=-1)
 
@@ -118,10 +117,8 @@ def process_audio(input_path, output_path):
 
     sf.write(output_path, y_clean, sr)
 
-    # GIẢI CỨU RAM BƯỚC 3: Dọn dẹp sạch sẽ
     del y, stft, phase, cleaned_padded, cleaned_stft, X_cleaned
     gc.collect()
-
 
 # ==========================================
 # 4. API ENDPOINTS (FastAPI)
@@ -130,8 +127,9 @@ def process_audio(input_path, output_path):
 def health_check():
     return {"status": "ok", "service": "AI Audio Denoiser"}
 
+# TUYỆT ĐỐI KHÔNG DÙNG "async def" Ở ĐÂY ĐỂ TRÁNH BLOCK MAIN THREAD
 @app.post("/api/clean-audio")
-async def clean_audio_api(audio: UploadFile = File(...)):
+def clean_audio_api(audio: UploadFile = File(...)):
     if not ai_model:
         raise HTTPException(status_code=500, detail="Mô hình AI chưa sẵn sàng")
     if not audio.filename:
@@ -144,20 +142,20 @@ async def clean_audio_api(audio: UploadFile = File(...)):
             wav_temp_path = os.path.join(temp_dir, 'converted_input.wav')
             output_temp_path = os.path.join(temp_dir, 'clean_output.wav')
 
-            # Đọc file
+            # Đọc file đồng bộ (thay cho await audio.read())
             with open(input_temp_path, "wb") as buffer:
-                buffer.write(await audio.read())
+                shutil.copyfileobj(audio.file, buffer)
             
-            print("🔄 Chuyển định dạng WebM -> WAV...")
+            print("🔄 Chuyển định dạng WebM -> WAV...", flush=True)
             audio_segment = AudioSegment.from_file(input_temp_path)
             audio_segment.export(wav_temp_path, format="wav")
             
             del audio_segment
             gc.collect()
 
-            print("🎙️ Đang xử lý AI...")
+            print("🎙️ Đang xử lý AI...", flush=True)
             process_audio(wav_temp_path, output_temp_path)
-            print("✨ Xử lý thành công!")
+            print("✨ Xử lý thành công!", flush=True)
             
             with open(output_temp_path, 'rb') as f:
                 return_data = io.BytesIO(f.read())
@@ -171,6 +169,6 @@ async def clean_audio_api(audio: UploadFile = File(...)):
 
     except Exception as e:
         import traceback
-        print(f"❌ Lỗi: {e}")
-        print(traceback.format_exc())
+        print(f"❌ Lỗi: {e}", flush=True)
+        print(traceback.format_exc(), flush=True)
         raise HTTPException(status_code=500, detail=str(e))
