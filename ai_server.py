@@ -1,6 +1,7 @@
 import os
 import tempfile
 import io
+import shutil
 import numpy as np
 import librosa
 import soundfile as sf
@@ -15,10 +16,10 @@ os.environ['OMP_NUM_THREADS'] = '1'
 
 app = FastAPI()
 
-# Cấu hình CORS chuẩn xác (Như trong ảnh tham khảo)
+# Cấu hình CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -119,12 +120,15 @@ def process_audio(input_path, output_path):
 # ==========================================
 # 3. API ENDPOINTS (FastAPI)
 # ==========================================
-@app.get("/")
-async def health_check():
+
+# Sửa lỗi 405 Method Not Allowed bằng cách nhận thêm phương thức HEAD
+@app.api_route("/", methods=["GET", "HEAD"])
+def health_check():
     return {"status": "ok", "service": "AI Audio Denoiser - FastAPI"}
 
+# BỎ CHỮ ASYNC ĐI! FastAPI sẽ tự động chạy hàm này trên một luồng nền độc lập (Background Thread)
 @app.post("/api/clean-audio")
-async def clean_audio_api(audio: UploadFile = File(...)):
+def clean_audio_api(audio: UploadFile = File(...)):
     if not audio.filename:
         raise HTTPException(status_code=400, detail="File rỗng")
 
@@ -135,9 +139,9 @@ async def clean_audio_api(audio: UploadFile = File(...)):
             wav_temp_path = os.path.join(temp_dir, 'converted_input.wav')
             output_temp_path = os.path.join(temp_dir, 'clean_output.wav')
 
-            # Lưu file bất đồng bộ (Rất nhanh)
+            # Đọc và lưu file theo kiểu đồng bộ vì đã bỏ chữ async
             with open(input_temp_path, "wb") as buffer:
-                buffer.write(await audio.read())
+                shutil.copyfileobj(audio.file, buffer)
             
             print("🔄 Đang chuyển đổi định dạng sang WAV...")
             audio_segment = AudioSegment.from_file(input_temp_path)
