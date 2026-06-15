@@ -5,26 +5,25 @@ import numpy as np
 import librosa
 import soundfile as sf
 from pydub import AudioSegment
-from flask import Flask, request, send_file, jsonify
-from flask_cors import CORS
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
-# Tối ưu hóa RAM và CPU cho server cloud miễn phí
+# Tối ưu hóa RAM và CPU
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 os.environ['OMP_NUM_THREADS'] = '1'
 
-# Khởi tạo Server Flask
-app = Flask(__name__)
-CORS(app)
+app = FastAPI()
 
-# Ép CORS Header cho mọi response để tránh lỗi Fake CORS của trình duyệt
-@app.after_request
-def add_cors_headers(response):
-    response.headers['Access-Control-Allow-Origin'] = '*'
-    response.headers['Access-Control-Allow-Methods'] = 'POST, GET, OPTIONS, PUT, DELETE'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
-    return response
+# Cấu hình CORS chuẩn xác (Như trong ảnh tham khảo)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], 
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Biến toàn cục chứa model
 ai_model = None
 
 # ==========================================
@@ -33,33 +32,28 @@ ai_model = None
 def get_model():
     global ai_model
     if ai_model is None:
-        print("⏳ LẦN CHẠY ĐẦU TIÊN: Đang nạp TensorFlow và Mô hình vào RAM...")
-        # Import tensorflow ở đây để Flask khởi động nhanh chớp nhoáng
+        print("⏳ Đang nạp TensorFlow và Mô hình vào RAM...")
         import tensorflow as tf
-        tf.config.set_visible_devices([], 'GPU') # Ép chạy CPU để tránh lỗi Driver
+        tf.config.set_visible_devices([], 'GPU')
         
         MODEL_PATH = os.path.join(os.path.dirname(__file__), 'model', 'denoise_softmask_best.h5')
         try:
             ai_model = tf.keras.models.load_model(MODEL_PATH, compile=False)
             dummy_input = np.zeros((1, 128, 128, 1), dtype=np.float32)
             ai_model.predict(dummy_input, verbose=0)
-            print("✅ Đã nạp mô hình thành công! Các lần sau sẽ chạy ngay lập tức.")
+            print("✅ Đã nạp mô hình thành công!")
         except Exception as e:
             print(f"❌ Lỗi tải mô hình: {e}")
             raise e
     return ai_model
 
-
 # ==========================================
 # 2. HÀM XỬ LÝ ÂM THANH CỐT LÕI
 # ==========================================
 def process_audio(input_path, output_path):
-    # Gọi hàm để lấy model (Nếu đã nạp rồi thì sẽ trả về luôn)
     model = get_model()
     
     y, sr = librosa.load(input_path, sr=16000)
-    print(f"  → Đã load audio: {len(y)} samples, sr={sr}")
-
     stft = librosa.stft(y, n_fft=254, hop_length=128)
     magnitude = np.abs(stft)
     phase = np.exp(1.j * np.angle(stft))
@@ -96,8 +90,6 @@ def process_audio(input_path, output_path):
         start_indices.append(start)
 
     X_input = np.array(chunks)[..., np.newaxis]
-    
-    # Dùng model đã nạp để predict
     X_cleaned = model.predict(X_input, verbose=0)
     X_cleaned = np.squeeze(X_cleaned, axis=-1)
 
@@ -124,39 +116,28 @@ def process_audio(input_path, output_path):
 
     sf.write(output_path, y_clean, sr)
 
-
 # ==========================================
-# 3. HEALTH CHECK & API ENDPOINT
+# 3. API ENDPOINTS (FastAPI)
 # ==========================================
-@app.route('/', methods=['GET'])
-def health_check():
-    # Ping nhanh để Render biết server đang sống mà không cần chờ load model
-    return jsonify({
-        "status": "ok",
-        "service": "AI Audio Denoiser",
-        "model_loaded": ai_model is not None
-    }), 200
+@app.get("/")
+async def health_check():
+    return {"status": "ok", "service": "AI Audio Denoiser - FastAPI"}
 
-
-@app.route('/api/clean-audio', methods=['POST'])
-def clean_audio_api():
-    if 'audio' not in request.files:
-        return jsonify({"error": "Không tìm thấy file âm thanh đính kèm"}), 400
-
-    audio_file = request.files['audio']
-    if audio_file.filename == '':
-        return jsonify({"error": "File rỗng"}), 400
+@app.post("/api/clean-audio")
+async def clean_audio_api(audio: UploadFile = File(...)):
+    if not audio.filename:
+        raise HTTPException(status_code=400, detail="File rỗng")
 
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
-            original_filename = audio_file.filename or "raw_input.webm"
-            ext = os.path.splitext(original_filename)[1].lower() or ".webm"
-
+            ext = os.path.splitext(audio.filename)[1].lower() or ".webm"
             input_temp_path = os.path.join(temp_dir, f'raw_input{ext}')
             wav_temp_path = os.path.join(temp_dir, 'converted_input.wav')
             output_temp_path = os.path.join(temp_dir, 'clean_output.wav')
 
-            audio_file.save(input_temp_path)
+            # Lưu file bất đồng bộ (Rất nhanh)
+            with open(input_temp_path, "wb") as buffer:
+                buffer.write(await audio.read())
             
             print("🔄 Đang chuyển đổi định dạng sang WAV...")
             audio_segment = AudioSegment.from_file(input_temp_path)
@@ -169,21 +150,14 @@ def clean_audio_api():
                 return_data = io.BytesIO(f.read())
 
         return_data.seek(0)
-        return send_file(
+        return StreamingResponse(
             return_data,
-            mimetype='audio/wav',
-            as_attachment=True,
-            download_name='clean_audio.wav'
+            media_type='audio/wav',
+            headers={"Content-Disposition": "attachment; filename=clean_audio.wav"}
         )
 
     except Exception as e:
         import traceback
-        print(f"❌ Lỗi trong quá trình xử lý: {e}")
+        print(f"❌ Lỗi: {e}")
         print(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
-
-
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 10000))
-    print(f"🚀 Server AI đang chạy tại cổng: {port}")
-    app.run(host='0.0.0.0', port=port, debug=False)
+        raise HTTPException(status_code=500, detail=str(e))

@@ -1,8 +1,8 @@
-Flask==3.0.0
-Flask-Cors==4.0.0
+fastapi==0.104.1
+uvicorn==0.24.0.post1
+python-multipart==0.0.6
 tensorflow-cpu
 librosa
 soundfile
 numpy
 pydub==0.25.1
-gunicorn==21.2.0

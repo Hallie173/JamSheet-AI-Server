@@ -25,4 +25,4 @@ EXPOSE 10000
 #    - threads=2: cho phép 2 luồng song song trong cùng 1 worker
 #    - timeout=300: tăng lên 5 phút vì CPU inference có thể chậm trên Render free tier
 #    - graceful-timeout=30: thời gian để worker hoàn thành request trước khi shutdown
-CMD ["gunicorn", "--workers=1", "--worker-class=gthread", "--threads=2", "--timeout=300", "--graceful-timeout=30", "--bind=0.0.0.0:10000", "ai_server:app"]
+CMD ["uvicorn", "ai_server:app", "--host", "0.0.0.0", "--port", "10000", "--timeout-keep-alive", "300"]
