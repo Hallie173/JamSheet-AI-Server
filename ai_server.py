@@ -13,6 +13,15 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
+# --- THÊM ĐOẠN NÀY ĐỂ ÉP CORS CHO MỌI REQUEST KỂ CẢ KHI CÓ LỖI ---
+@app.after_request
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'POST, GET, OPTIONS, PUT, DELETE'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    return response
+# -----------------------------------------------------------------
+
 # ==========================================
 # 1. TẢI MÔ HÌNH VÀO BỘ NHỚ (Chỉ tải 1 lần khi bật server)
 # ==========================================
