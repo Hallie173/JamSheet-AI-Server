@@ -5,6 +5,7 @@ import numpy as np
 import librosa
 import soundfile as sf
 import tensorflow as tf
+from pydub import AudioSegment  # Thêm thư viện pydub
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 
@@ -120,17 +121,23 @@ def clean_audio_api():
         return jsonify({"error": "File rỗng"}), 400
 
     try:
-            # Tạo thư mục tạm để lưu file người dùng gửi lên và file AI xuất ra
+        # Tạo thư mục tạm để lưu file người dùng gửi lên và file AI xuất ra
         with tempfile.TemporaryDirectory() as temp_dir:
             input_temp_path = os.path.join(temp_dir, 'raw_input.webm')
+            wav_temp_path = os.path.join(temp_dir, 'converted_input.wav')
             output_temp_path = os.path.join(temp_dir, 'clean_output.wav')
             
             # Lưu file gốc (webm)
             audio_file.save(input_temp_path)
             
-            # Gọi hàm xử lý AI
+            # Chuyển đổi webm sang wav bằng pydub trước khi đưa vào librosa
+            print("🔄 Đang chuyển đổi định dạng WebM sang WAV...")
+            audio_segment = AudioSegment.from_file(input_temp_path)
+            audio_segment.export(wav_temp_path, format="wav")
+            
+            # Gọi hàm xử lý AI với tệp wav đã được chuyển đổi
             print("🎙️ Đã nhận yêu cầu lọc ồn. Đang xử lý...")
-            process_audio(input_temp_path, output_temp_path)
+            process_audio(wav_temp_path, output_temp_path)
             print("✨ Xử lý xong! Đang nạp dữ liệu vào RAM...")
             
             # Đọc file âm thanh từ ổ cứng vào bộ nhớ RAM (BytesIO)
@@ -152,8 +159,8 @@ def clean_audio_api():
         )
                 
     except Exception as e:
-            print(f"❌ Lỗi trong quá trình xử lý: {e}")
-            return jsonify({"error": str(e)}), 500
+        print(f"❌ Lỗi trong quá trình xử lý: {e}")
+        return jsonify({"error": str(e)}), 500
 
 # Chạy Server
 if __name__ == '__main__':
