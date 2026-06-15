@@ -1,7 +1,7 @@
 import os
 import tempfile
 import io
-import shutil
+import gc
 import numpy as np
 import librosa
 import soundfile as sf
@@ -10,13 +10,15 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-# Tối ưu hóa RAM và CPU
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+# 1. TỐI ƯU HÓA PHẦN CỨNG CHO CLOUD MIỄN PHÍ
+# Ép TensorFlow chỉ dùng 1 luồng, hạn chế tranh giành CPU và cấm spam log
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['TF_NUM_INTRAOP_THREADS'] = '1'
+os.environ['TF_NUM_INTEROP_THREADS'] = '1'
 
 app = FastAPI()
 
-# Cấu hình CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,35 +27,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-ai_model = None
+# 2. TẢI MÔ HÌNH TOÀN CỤC (Tránh lỗi phân mảnh bộ nhớ khi load nhiều lần)
+import tensorflow as tf
+tf.config.set_visible_devices([], 'GPU') # Tắt GPU hoàn toàn
+
+MODEL_PATH = os.path.join(os.path.dirname(__file__), 'model', 'denoise_softmask_best.h5')
+try:
+    print("⏳ Đang tải mô hình AI vào RAM...")
+    ai_model = tf.keras.models.load_model(MODEL_PATH, compile=False)
+    # Khởi động nóng (Warm-up) để giãn nở RAM trước
+    ai_model.predict(np.zeros((1, 128, 128, 1), dtype=np.float32), verbose=0)
+    print("✅ Mô hình đã sẵn sàng!")
+except Exception as e:
+    print(f"❌ Lỗi tải mô hình: {e}")
+    ai_model = None
 
 # ==========================================
-# 1. KỸ THUẬT LAZY LOAD MODEL
-# ==========================================
-def get_model():
-    global ai_model
-    if ai_model is None:
-        print("⏳ Đang nạp TensorFlow và Mô hình vào RAM...")
-        import tensorflow as tf
-        tf.config.set_visible_devices([], 'GPU')
-        
-        MODEL_PATH = os.path.join(os.path.dirname(__file__), 'model', 'denoise_softmask_best.h5')
-        try:
-            ai_model = tf.keras.models.load_model(MODEL_PATH, compile=False)
-            dummy_input = np.zeros((1, 128, 128, 1), dtype=np.float32)
-            ai_model.predict(dummy_input, verbose=0)
-            print("✅ Đã nạp mô hình thành công!")
-        except Exception as e:
-            print(f"❌ Lỗi tải mô hình: {e}")
-            raise e
-    return ai_model
-
-# ==========================================
-# 2. HÀM XỬ LÝ ÂM THANH CỐT LÕI
+# 3. HÀM XỬ LÝ ÂM THANH CỐT LÕI (TIẾT KIỆM RAM)
 # ==========================================
 def process_audio(input_path, output_path):
-    model = get_model()
-    
     y, sr = librosa.load(input_path, sr=16000)
     stft = librosa.stft(y, n_fft=254, hop_length=128)
     magnitude = np.abs(stft)
@@ -91,8 +83,17 @@ def process_audio(input_path, output_path):
         start_indices.append(start)
 
     X_input = np.array(chunks)[..., np.newaxis]
-    X_cleaned = model.predict(X_input, verbose=0)
+
+    # GIẢI CỨU RAM BƯỚC 1: Xóa ngay các biến không dùng nữa
+    del chunks, norm_spectrogram, log_spectrogram, magnitude
+    gc.collect()
+
+    # GIẢI CỨU RAM BƯỚC 2: Thêm batch_size=8 để AI ăn từ từ, không bị nghẹn!
+    X_cleaned = ai_model.predict(X_input, batch_size=8, verbose=0)
     X_cleaned = np.squeeze(X_cleaned, axis=-1)
+
+    del X_input
+    gc.collect()
 
     cleaned_padded = np.zeros((freq_bins, padded_time_frames))
     overlap_count = np.zeros((freq_bins, padded_time_frames))
@@ -117,18 +118,22 @@ def process_audio(input_path, output_path):
 
     sf.write(output_path, y_clean, sr)
 
-# ==========================================
-# 3. API ENDPOINTS (FastAPI)
-# ==========================================
+    # GIẢI CỨU RAM BƯỚC 3: Dọn dẹp sạch sẽ
+    del y, stft, phase, cleaned_padded, cleaned_stft, X_cleaned
+    gc.collect()
 
-# Sửa lỗi 405 Method Not Allowed bằng cách nhận thêm phương thức HEAD
+
+# ==========================================
+# 4. API ENDPOINTS (FastAPI)
+# ==========================================
 @app.api_route("/", methods=["GET", "HEAD"])
 def health_check():
-    return {"status": "ok", "service": "AI Audio Denoiser - FastAPI"}
+    return {"status": "ok", "service": "AI Audio Denoiser"}
 
-# BỎ CHỮ ASYNC ĐI! FastAPI sẽ tự động chạy hàm này trên một luồng nền độc lập (Background Thread)
 @app.post("/api/clean-audio")
-def clean_audio_api(audio: UploadFile = File(...)):
+async def clean_audio_api(audio: UploadFile = File(...)):
+    if not ai_model:
+        raise HTTPException(status_code=500, detail="Mô hình AI chưa sẵn sàng")
     if not audio.filename:
         raise HTTPException(status_code=400, detail="File rỗng")
 
@@ -139,16 +144,20 @@ def clean_audio_api(audio: UploadFile = File(...)):
             wav_temp_path = os.path.join(temp_dir, 'converted_input.wav')
             output_temp_path = os.path.join(temp_dir, 'clean_output.wav')
 
-            # Đọc và lưu file theo kiểu đồng bộ vì đã bỏ chữ async
+            # Đọc file
             with open(input_temp_path, "wb") as buffer:
-                shutil.copyfileobj(audio.file, buffer)
+                buffer.write(await audio.read())
             
-            print("🔄 Đang chuyển đổi định dạng sang WAV...")
+            print("🔄 Chuyển định dạng WebM -> WAV...")
             audio_segment = AudioSegment.from_file(input_temp_path)
             audio_segment.export(wav_temp_path, format="wav")
+            
+            del audio_segment
+            gc.collect()
 
-            print("🎙️ Đang xử lý AI denoising...")
+            print("🎙️ Đang xử lý AI...")
             process_audio(wav_temp_path, output_temp_path)
+            print("✨ Xử lý thành công!")
             
             with open(output_temp_path, 'rb') as f:
                 return_data = io.BytesIO(f.read())
