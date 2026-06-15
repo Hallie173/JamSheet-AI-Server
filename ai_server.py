@@ -20,8 +20,13 @@ MODEL_PATH = os.path.join(os.path.dirname(__file__), 'model', 'denoise_softmask_
 
 print("⏳ Đang tải mô hình AI. Vui lòng đợi...")
 try:
-    model = tf.keras.models.load_model(MODEL_PATH)
-    print("✅ Đã tải mô hình thành công!")
+    # compile=False: Bỏ qua việc build metrics (không cần thiết cho inference)
+    # Tránh warning "compile_metrics have yet to be built" và tiết kiệm RAM
+    model = tf.keras.models.load_model(MODEL_PATH, compile=False)
+    # Warm up model: chạy 1 lần với input giả để tránh cold-start chậm ở request đầu tiên
+    dummy_input = np.zeros((1, 128, 128, 1), dtype=np.float32)
+    model.predict(dummy_input, verbose=0)
+    print("✅ Đã tải và khởi động mô hình thành công!")
 except Exception as e:
     print(f"❌ LỖI tải mô hình: {e}")
     model = None
@@ -31,13 +36,18 @@ except Exception as e:
 # 2. HÀM XỬ LÝ ÂM THANH CỐT LÕI
 # ==========================================
 def process_audio(input_path, output_path):
-    # Load file bằng soundfile trước (nhanh hơn), fallback sang audioread
+    # Load file âm thanh, resample về 16000 Hz
     y, sr = librosa.load(input_path, sr=16000)
+    print(f"  → Đã load audio: {len(y)} samples, sr={sr}")
 
     # Bước 1: STFT
+    # n_fft=254 → n_fft//2 + 1 = 128 frequency bins (khớp với input model)
     stft = librosa.stft(y, n_fft=254, hop_length=128)
     magnitude = np.abs(stft)
     phase = np.exp(1.j * np.angle(stft))
+
+    freq_bins = magnitude.shape[0]  # Lấy động thay vì hardcode 128
+    print(f"  → STFT shape: {magnitude.shape} (freq_bins={freq_bins})")
 
     log_spectrogram = librosa.amplitude_to_db(magnitude, ref=np.max)
     min_val = np.min(log_spectrogram)
@@ -70,14 +80,16 @@ def process_audio(input_path, output_path):
         start_indices.append(start)
 
     X_input = np.array(chunks)[..., np.newaxis]
+    print(f"  → Số chunks: {num_chunks}, X_input shape: {X_input.shape}")
 
     # AI Inference
     X_cleaned = model.predict(X_input, verbose=0)
     X_cleaned = np.squeeze(X_cleaned, axis=-1)
+    print(f"  → X_cleaned shape: {X_cleaned.shape}")
 
-    # Bước 3: Reconstruction
-    cleaned_padded = np.zeros((128, padded_time_frames))
-    overlap_count = np.zeros((128, padded_time_frames))
+    # Bước 3: Reconstruction (Dùng freq_bins động thay vì hardcode 128)
+    cleaned_padded = np.zeros((freq_bins, padded_time_frames))
+    overlap_count = np.zeros((freq_bins, padded_time_frames))
 
     for i in range(num_chunks):
         start = start_indices[i]
@@ -99,6 +111,7 @@ def process_audio(input_path, output_path):
         y_clean = y_clean * (0.8 / max_amplitude)
 
     sf.write(output_path, y_clean, sr)
+    print(f"  → Đã ghi file output: {output_path}")
 
 
 # ==========================================
@@ -107,7 +120,11 @@ def process_audio(input_path, output_path):
 @app.route('/', methods=['GET'])
 def health_check():
     status = "ok" if model is not None else "model_not_loaded"
-    return jsonify({"status": status, "service": "AI Audio Denoiser"}), 200
+    return jsonify({
+        "status": status,
+        "service": "AI Audio Denoiser",
+        "model_loaded": model is not None
+    }), 200
 
 
 # ==========================================
@@ -128,19 +145,25 @@ def clean_audio_api():
 
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
-            input_temp_path = os.path.join(temp_dir, 'raw_input.webm')
+            # Lấy extension gốc của file để xử lý đúng
+            original_filename = audio_file.filename or "raw_input.webm"
+            ext = os.path.splitext(original_filename)[1].lower() or ".webm"
+
+            input_temp_path = os.path.join(temp_dir, f'raw_input{ext}')
             wav_temp_path = os.path.join(temp_dir, 'converted_input.wav')
             output_temp_path = os.path.join(temp_dir, 'clean_output.wav')
 
             # Lưu file gốc
             audio_file.save(input_temp_path)
+            print(f"🔄 Đã nhận file: {original_filename} ({os.path.getsize(input_temp_path)} bytes)")
 
             # Chuyển đổi sang WAV bằng pydub (dùng ffmpeg bên dưới)
             print("🔄 Đang chuyển đổi định dạng sang WAV...")
             audio_segment = AudioSegment.from_file(input_temp_path)
             audio_segment.export(wav_temp_path, format="wav")
+            print(f"  → Converted WAV: {os.path.getsize(wav_temp_path)} bytes, duration={len(audio_segment)/1000:.1f}s")
 
-            print("🎙️ Đã nhận yêu cầu lọc ồn. Đang xử lý AI...")
+            print("🎙️ Đang xử lý AI denoising...")
             process_audio(wav_temp_path, output_temp_path)
             print("✨ Xử lý xong! Đang đọc vào RAM...")
 
@@ -158,7 +181,9 @@ def clean_audio_api():
         )
 
     except Exception as e:
+        import traceback
         print(f"❌ Lỗi trong quá trình xử lý: {e}")
+        print(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
 
