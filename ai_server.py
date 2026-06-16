@@ -42,100 +42,117 @@ except Exception as e:
     ai_model = None
 
 # ==========================================
-# 3. HÀM XỬ LÝ ÂM THANH CỐT LÕI (BẢN VÁ TỐI ƯU RAM TUYỆT ĐỐI)
+# 3. HÀM XỬ LÝ ÂM THANH CỐT LÕI (CHIA ĐỂ TRỊ)
 # ==========================================
 def process_audio(input_path, output_path):
     y, sr = librosa.load(input_path, sr=16000)
-    stft = librosa.stft(y, n_fft=254, hop_length=128)
-    magnitude = np.abs(stft)
-    phase = np.exp(1.j * np.angle(stft))
+    
+    # CẮT DÒNG THỜI GIAN: Chia file thành các block 10 giây để chống tràn RAM
+    SEGMENT_SECONDS = 10
+    segment_samples = SEGMENT_SECONDS * sr
+    
+    y_clean_full = [] # Mảng chứa các mảnh âm thanh đã lọc sạch
 
-    freq_bins = magnitude.shape[0]
-
-    log_spectrogram = librosa.amplitude_to_db(magnitude, ref=np.max)
-    min_val = np.min(log_spectrogram)
-    max_val = np.max(log_spectrogram)
-    norm_spectrogram = (log_spectrogram - min_val) / (max_val - min_val + 1e-8)
-
-    time_frames = norm_spectrogram.shape[1]
-    window_size = 128
-    step_size = 32
-
-    if time_frames < window_size:
-        num_chunks = 1
-        padded_time_frames = window_size
-    else:
-        num_chunks = int(np.ceil((time_frames - window_size) / step_size)) + 1
-        padded_time_frames = (num_chunks - 1) * step_size + window_size
-
-    pad_len = padded_time_frames - time_frames
-    if pad_len > 0:
-        norm_spectrogram = np.pad(norm_spectrogram, ((0, 0), (0, pad_len)), mode='constant')
-
-    chunks = []
-    start_indices = []
-
-    for i in range(num_chunks):
-        start = i * step_size
-        chunk = norm_spectrogram[:, start: start + window_size]
-        chunks.append(chunk)
-        start_indices.append(start)
-
-    X_input = np.array(chunks)[..., np.newaxis]
-
-    del chunks, norm_spectrogram, log_spectrogram, magnitude
-    gc.collect()
-
-    # --- KHU VỰC THAY ĐỔI CỐT LÕI: Inference thủ công ---
-    X_cleaned = np.zeros((num_chunks, 128, 128), dtype=np.float32)
-    batch_size = 4  # Xử lý theo từng lô cực nhỏ
-
-    # Vòng lặp thủ công thay vì dùng .predict() của Keras để bỏ qua overhead ngầm
-    for i in range(0, num_chunks, batch_size):
-        end_idx = min(i + batch_size, num_chunks)
-        # Ép kiểu dữ liệu nghiêm ngặt để tiết kiệm RAM
-        batch = tf.convert_to_tensor(X_input[i:end_idx], dtype=tf.float32)
+    # Vòng lặp xử lý từng đoạn 10 giây
+    for start_sample in range(0, len(y), segment_samples):
+        end_sample = min(start_sample + segment_samples, len(y))
+        y_segment = y[start_sample:end_sample]
         
-        # Gọi mô hình như một hàm số trực tiếp (Callable), không dùng .predict()
-        pred = ai_model(batch, training=False).numpy()
-        X_cleaned[i:end_idx] = np.squeeze(pred, axis=-1)
-        
-        # Hủy các biến trung gian ngay lập tức để giải phóng RAM cho lô tiếp theo
-        del batch, pred
+        # --- TIỀN XỬ LÝ CHO ĐOẠN 10 GIÂY ---
+        stft = librosa.stft(y_segment, n_fft=254, hop_length=128)
+        magnitude = np.abs(stft)
+        phase = np.exp(1.j * np.angle(stft))
+
+        freq_bins = magnitude.shape[0]
+
+        log_spectrogram = librosa.amplitude_to_db(magnitude, ref=np.max)
+        min_val = np.min(log_spectrogram)
+        max_val = np.max(log_spectrogram)
+        norm_spectrogram = (log_spectrogram - min_val) / (max_val - min_val + 1e-8)
+
+        time_frames = norm_spectrogram.shape[1]
+        window_size = 128
+        step_size = 32
+
+        if time_frames < window_size:
+            num_chunks = 1
+            padded_time_frames = window_size
+        else:
+            num_chunks = int(np.ceil((time_frames - window_size) / step_size)) + 1
+            padded_time_frames = (num_chunks - 1) * step_size + window_size
+
+        pad_len = padded_time_frames - time_frames
+        if pad_len > 0:
+            norm_spectrogram = np.pad(norm_spectrogram, ((0, 0), (0, pad_len)), mode='constant')
+
+        chunks = []
+        start_indices = []
+
+        for i in range(num_chunks):
+            start = i * step_size
+            chunk = norm_spectrogram[:, start: start + window_size]
+            chunks.append(chunk)
+            start_indices.append(start)
+
+        X_input = np.array(chunks)[..., np.newaxis]
+
+        del chunks, norm_spectrogram, log_spectrogram, magnitude
         gc.collect()
 
-    del X_input
-    gc.collect()
-    # --------------------------------------------------
+        # --- LỌC AI CHO ĐOẠN 10 GIÂY ---
+        X_cleaned = np.zeros((num_chunks, 128, 128), dtype=np.float32)
+        batch_size = 4 
 
-    cleaned_padded = np.zeros((freq_bins, padded_time_frames))
-    overlap_count = np.zeros((freq_bins, padded_time_frames))
+        for i in range(0, num_chunks, batch_size):
+            end_idx = min(i + batch_size, num_chunks)
+            batch = tf.convert_to_tensor(X_input[i:end_idx], dtype=tf.float32)
+            pred = ai_model(batch, training=False).numpy()
+            X_cleaned[i:end_idx] = np.squeeze(pred, axis=-1)
+            del batch, pred
+            gc.collect()
 
-    for i in range(num_chunks):
-        start = start_indices[i]
-        cleaned_padded[:, start: start + window_size] += X_cleaned[i]
-        overlap_count[:, start: start + window_size] += 1
+        del X_input
+        gc.collect()
 
-    cleaned_padded /= np.maximum(overlap_count, 1)
-    cleaned_spectrogram_norm = cleaned_padded[:, :time_frames]
+        # --- HẬU XỬ LÝ (RÁP NỐI STFT) CHO ĐOẠN 10 GIÂY ---
+        cleaned_padded = np.zeros((freq_bins, padded_time_frames))
+        overlap_count = np.zeros((freq_bins, padded_time_frames))
 
-    cleaned_log_spectrogram = cleaned_spectrogram_norm * (max_val - min_val + 1e-8) + min_val
-    cleaned_magnitude = librosa.db_to_amplitude(cleaned_log_spectrogram)
-    cleaned_stft = cleaned_magnitude * phase
+        for i in range(num_chunks):
+            start = start_indices[i]
+            cleaned_padded[:, start: start + window_size] += X_cleaned[i]
+            overlap_count[:, start: start + window_size] += 1
 
-    y_clean = librosa.istft(cleaned_stft, hop_length=128, length=len(y))
+        cleaned_padded /= np.maximum(overlap_count, 1)
+        cleaned_spectrogram_norm = cleaned_padded[:, :time_frames]
 
-    max_amplitude = np.max(np.abs(y_clean))
+        cleaned_log_spectrogram = cleaned_spectrogram_norm * (max_val - min_val + 1e-8) + min_val
+        cleaned_magnitude = librosa.db_to_amplitude(cleaned_log_spectrogram)
+        cleaned_stft = cleaned_magnitude * phase
+
+        # Chuyển về sóng âm và đưa vào mảng lưu trữ tổng
+        y_clean_segment = librosa.istft(cleaned_stft, hop_length=128, length=len(y_segment))
+        y_clean_full.append(y_clean_segment)
+
+        # Dọn sạch sành sanh mọi dữ liệu của block 10s này để đón block mới
+        del stft, phase, cleaned_padded, overlap_count, cleaned_spectrogram_norm, cleaned_log_spectrogram, cleaned_magnitude, cleaned_stft, X_cleaned, y_clean_segment, y_segment
+        gc.collect()
+
+    # --- NỐI TẤT CẢ CÁC ĐOẠN LẠI THÀNH FILE HOÀN CHỈNH ---
+    y_final = np.concatenate(y_clean_full)
+    
+    max_amplitude = np.max(np.abs(y_final))
     if max_amplitude > 0:
-        y_clean = y_clean * (0.8 / max_amplitude)
+        y_final = y_final * (0.8 / max_amplitude)
 
-    sf.write(output_path, y_clean, sr)
+    sf.write(output_path, y_final, sr)
 
-    del y, stft, phase, cleaned_padded, cleaned_stft, X_cleaned
+    del y, y_clean_full, y_final
     gc.collect()
+
 
 # ==========================================
-# 4. API ENDPOINTS (FastAPI)
+# 4. API ENDPOINTS
 # ==========================================
 @app.api_route("/", methods=["GET", "HEAD"])
 def health_check():
