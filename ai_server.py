@@ -3,9 +3,14 @@ import tempfile
 import io
 import gc
 import shutil
-import time  # THÊM THƯ VIỆN NÀY
+import time
 import numpy as np
+import threading
+import uuid
 
+# ==========================================
+# 1. TỐI ƯU HÓA PHẦN CỨNG HỆ THỐNG
+# ==========================================
 os.environ['MALLOC_ARENA_MAX'] = '1'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['OMP_NUM_THREADS'] = '1'
@@ -18,7 +23,6 @@ from pydub import AudioSegment
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-import uuid
 
 app = FastAPI()
 
@@ -30,6 +34,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ==========================================
+# 2. TẢI MÔ HÌNH TOÀN CỤC VÀO RAM
+# ==========================================
 import tensorflow as tf
 tf.config.set_visible_devices([], 'GPU')
 
@@ -37,6 +44,7 @@ MODEL_PATH = os.path.join(os.path.dirname(__file__), 'model', 'denoise_softmask_
 try:
     print("⏳ Đang tải mô hình AI vào RAM...", flush=True)
     ai_model = tf.keras.models.load_model(MODEL_PATH, compile=False)
+    # Khởi động nóng mô hình
     ai_model.predict(np.zeros((1, 128, 128, 1), dtype=np.float32), verbose=0)
     print("✅ Mô hình đã sẵn sàng!", flush=True)
 except Exception as e:
@@ -44,13 +52,17 @@ except Exception as e:
     ai_model = None
 
 # ==========================================
-# CƠ CHẾ BẤT ĐỒNG BỘ POLLING
+# 3. CƠ CHẾ BẤT ĐỒNG BỘ POLLING & MUTEX LOCK
 # ==========================================
 tasks_db = {}
+
+# Khóa Mutex đảm bảo chỉ xử lý 1 file tại 1 thời điểm để chống tràn RAM
+ai_processing_lock = threading.Lock()
 
 def process_audio(input_path, output_path, task_id):
     y, sr = librosa.load(input_path, sr=16000)
     
+    # Chia nhỏ file thành từng khối 5 giây
     SEGMENT_SECONDS = 5
     segment_samples = SEGMENT_SECONDS * sr
     y_clean_full = [] 
@@ -65,6 +77,7 @@ def process_audio(input_path, output_path, task_id):
         end_sample = min(start_sample + segment_samples, len(y))
         y_segment = y[start_sample:end_sample]
         
+        # Tiền xử lý (STFT)
         stft = librosa.stft(y_segment, n_fft=254, hop_length=128)
         magnitude = np.abs(stft)
         phase = np.exp(1.j * np.angle(stft))
@@ -105,7 +118,7 @@ def process_audio(input_path, output_path, task_id):
         del chunks, norm_spectrogram, log_spectrogram, magnitude
         gc.collect()
 
-        # Dùng Callable (ai_model) thay vì .predict để chống phình to Memory Keras
+        # Suy luận AI (Inference)
         X_cleaned = np.zeros((num_chunks, 128, 128), dtype=np.float32)
         batch_size = 4 
 
@@ -120,6 +133,7 @@ def process_audio(input_path, output_path, task_id):
         del X_input
         gc.collect()
 
+        # Hậu xử lý (Tái tạo âm thanh)
         cleaned_padded = np.zeros((freq_bins, padded_time_frames))
         overlap_count = np.zeros((freq_bins, padded_time_frames))
 
@@ -138,13 +152,14 @@ def process_audio(input_path, output_path, task_id):
         y_clean_segment = librosa.istft(cleaned_stft, hop_length=128, length=len(y_segment))
         y_clean_full.append(y_clean_segment)
 
+        # Dọn rác bộ nhớ sau mỗi 5s
         del stft, phase, cleaned_padded, overlap_count, cleaned_spectrogram_norm, cleaned_log_spectrogram, cleaned_magnitude, cleaned_stft, X_cleaned, y_clean_segment, y_segment
         gc.collect()
 
-        # --- ĐIỂM SÁNG GIẢI CỨU CPU STARVATION ---
-        # Ép luồng AI ngủ 0.5 giây để nhường CPU cho FastAPI trả lời Polling
+        # Giải cứu CPU Starvation: Ngủ 0.5s để hệ thống trả lời Polling
         time.sleep(0.5)
 
+    # Nối các mảnh 5s lại thành audio hoàn chỉnh
     y_final = np.concatenate(y_clean_full)
     
     max_amplitude = np.max(np.abs(y_final))
@@ -159,20 +174,32 @@ def process_audio(input_path, output_path, task_id):
 
 def run_ai_background(task_id: str, input_path: str, wav_temp_path: str, output_temp_path: str):
     try:
-        audio_segment = AudioSegment.from_file(input_path)
-        audio_segment.export(wav_temp_path, format="wav")
-        del audio_segment
-        gc.collect()
-
-        process_audio(wav_temp_path, output_temp_path, task_id)
+        print(f"[{task_id}] ⏳ Đang xếp hàng chờ đến lượt xử lý...", flush=True)
         
-        tasks_db[task_id]["status"] = "completed"
-        tasks_db[task_id]["result_file"] = output_temp_path
+        # Chỉ cho phép 1 luồng đi qua, các luồng khác sẽ đứng đợi ở đây
+        with ai_processing_lock:
+            print(f"[{task_id}] 🟢 Đã đến lượt! Bắt đầu xử lý...", flush=True)
+            
+            audio_segment = AudioSegment.from_file(input_path)
+            audio_segment.export(wav_temp_path, format="wav")
+            del audio_segment
+            gc.collect()
+
+            process_audio(wav_temp_path, output_temp_path, task_id)
+            
+            tasks_db[task_id]["status"] = "completed"
+            tasks_db[task_id]["result_file"] = output_temp_path
+            
+            print(f"[{task_id}] ✨ Đã hoàn thành! Mở khóa cho người tiếp theo.", flush=True)
+            
     except Exception as e:
         import traceback
         print(f"[{task_id}] ❌ Lỗi: {e}", flush=True)
         tasks_db[task_id] = {"status": "failed", "error": str(e)}
 
+# ==========================================
+# 4. API ENDPOINTS
+# ==========================================
 @app.api_route("/", methods=["GET", "HEAD"])
 def health_check():
     return {"status": "ok", "service": "AI Audio Denoiser"}
@@ -191,12 +218,15 @@ def clean_audio_api(background_tasks: BackgroundTasks, audio: UploadFile = File(
     wav_temp_path = os.path.join(temp_dir, f'converted_{task_id}.wav')
     output_temp_path = os.path.join(temp_dir, f'clean_{task_id}.wav')
 
+    # Lưu file âm thanh gốc
     with open(input_temp_path, "wb") as buffer:
         shutil.copyfileobj(audio.file, buffer)
 
+    # Đăng ký nhiệm vụ và ném vào luồng nền
     tasks_db[task_id] = {"status": "processing"}
     background_tasks.add_task(run_ai_background, task_id, input_temp_path, wav_temp_path, output_temp_path)
 
+    # Trả về mã số vé ngay lập tức
     return {"task_id": task_id, "status": "processing"}
 
 @app.get("/api/task-status/{task_id}")
@@ -214,10 +244,12 @@ def download_result(task_id: str):
     
     file_path = task["result_file"]
     
+    # Nạp file sạch vào RAM
     with open(file_path, 'rb') as f:
         return_data = io.BytesIO(f.read())
     return_data.seek(0)
     
+    # Dọn dẹp Database và Xóa file rác trên ổ cứng
     del tasks_db[task_id]
     shutil.rmtree(os.path.dirname(file_path), ignore_errors=True)
     gc.collect()
