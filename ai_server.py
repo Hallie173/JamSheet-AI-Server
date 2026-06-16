@@ -3,19 +3,22 @@ import tempfile
 import io
 import gc
 import shutil
+import time  # THÊM THƯ VIỆN NÀY
 import numpy as np
-import librosa
-import soundfile as sf
-from pydub import AudioSegment
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 
-# 1. TỐI ƯU HÓA PHẦN CỨNG
+os.environ['MALLOC_ARENA_MAX'] = '1'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['TF_NUM_INTRAOP_THREADS'] = '1'
 os.environ['TF_NUM_INTEROP_THREADS'] = '1'
+
+import librosa
+import soundfile as sf
+from pydub import AudioSegment
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+import uuid
 
 app = FastAPI()
 
@@ -27,7 +30,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 2. TẢI MÔ HÌNH TOÀN CỤC VÀO RAM
 import tensorflow as tf
 tf.config.set_visible_devices([], 'GPU')
 
@@ -42,23 +44,27 @@ except Exception as e:
     ai_model = None
 
 # ==========================================
-# 3. HÀM XỬ LÝ ÂM THANH CỐT LÕI (CHIA ĐỂ TRỊ)
+# CƠ CHẾ BẤT ĐỒNG BỘ POLLING
 # ==========================================
-def process_audio(input_path, output_path):
+tasks_db = {}
+
+def process_audio(input_path, output_path, task_id):
     y, sr = librosa.load(input_path, sr=16000)
     
-    # CẮT DÒNG THỜI GIAN: Chia file thành các block 10 giây để chống tràn RAM
-    SEGMENT_SECONDS = 10
+    SEGMENT_SECONDS = 5
     segment_samples = SEGMENT_SECONDS * sr
-    
-    y_clean_full = [] # Mảng chứa các mảnh âm thanh đã lọc sạch
+    y_clean_full = [] 
 
-    # Vòng lặp xử lý từng đoạn 10 giây
+    total_segments = len(range(0, len(y), segment_samples))
+    current_segment = 0
+
     for start_sample in range(0, len(y), segment_samples):
+        current_segment += 1
+        print(f"[{task_id}] ⚙️ Đang xử lý đoạn {current_segment}/{total_segments}...", flush=True)
+
         end_sample = min(start_sample + segment_samples, len(y))
         y_segment = y[start_sample:end_sample]
         
-        # --- TIỀN XỬ LÝ CHO ĐOẠN 10 GIÂY ---
         stft = librosa.stft(y_segment, n_fft=254, hop_length=128)
         magnitude = np.abs(stft)
         phase = np.exp(1.j * np.angle(stft))
@@ -99,7 +105,7 @@ def process_audio(input_path, output_path):
         del chunks, norm_spectrogram, log_spectrogram, magnitude
         gc.collect()
 
-        # --- LỌC AI CHO ĐOẠN 10 GIÂY ---
+        # Dùng Callable (ai_model) thay vì .predict để chống phình to Memory Keras
         X_cleaned = np.zeros((num_chunks, 128, 128), dtype=np.float32)
         batch_size = 4 
 
@@ -114,7 +120,6 @@ def process_audio(input_path, output_path):
         del X_input
         gc.collect()
 
-        # --- HẬU XỬ LÝ (RÁP NỐI STFT) CHO ĐOẠN 10 GIÂY ---
         cleaned_padded = np.zeros((freq_bins, padded_time_frames))
         overlap_count = np.zeros((freq_bins, padded_time_frames))
 
@@ -130,15 +135,16 @@ def process_audio(input_path, output_path):
         cleaned_magnitude = librosa.db_to_amplitude(cleaned_log_spectrogram)
         cleaned_stft = cleaned_magnitude * phase
 
-        # Chuyển về sóng âm và đưa vào mảng lưu trữ tổng
         y_clean_segment = librosa.istft(cleaned_stft, hop_length=128, length=len(y_segment))
         y_clean_full.append(y_clean_segment)
 
-        # Dọn sạch sành sanh mọi dữ liệu của block 10s này để đón block mới
         del stft, phase, cleaned_padded, overlap_count, cleaned_spectrogram_norm, cleaned_log_spectrogram, cleaned_magnitude, cleaned_stft, X_cleaned, y_clean_segment, y_segment
         gc.collect()
 
-    # --- NỐI TẤT CẢ CÁC ĐOẠN LẠI THÀNH FILE HOÀN CHỈNH ---
+        # --- ĐIỂM SÁNG GIẢI CỨU CPU STARVATION ---
+        # Ép luồng AI ngủ 0.5 giây để nhường CPU cho FastAPI trả lời Polling
+        time.sleep(0.5)
+
     y_final = np.concatenate(y_clean_full)
     
     max_amplitude = np.max(np.abs(y_final))
@@ -151,53 +157,73 @@ def process_audio(input_path, output_path):
     gc.collect()
 
 
-# ==========================================
-# 4. API ENDPOINTS
-# ==========================================
+def run_ai_background(task_id: str, input_path: str, wav_temp_path: str, output_temp_path: str):
+    try:
+        audio_segment = AudioSegment.from_file(input_path)
+        audio_segment.export(wav_temp_path, format="wav")
+        del audio_segment
+        gc.collect()
+
+        process_audio(wav_temp_path, output_temp_path, task_id)
+        
+        tasks_db[task_id]["status"] = "completed"
+        tasks_db[task_id]["result_file"] = output_temp_path
+    except Exception as e:
+        import traceback
+        print(f"[{task_id}] ❌ Lỗi: {e}", flush=True)
+        tasks_db[task_id] = {"status": "failed", "error": str(e)}
+
 @app.api_route("/", methods=["GET", "HEAD"])
 def health_check():
     return {"status": "ok", "service": "AI Audio Denoiser"}
 
 @app.post("/api/clean-audio")
-def clean_audio_api(audio: UploadFile = File(...)):
+def clean_audio_api(background_tasks: BackgroundTasks, audio: UploadFile = File(...)):
     if not ai_model:
         raise HTTPException(status_code=500, detail="Mô hình AI chưa sẵn sàng")
     if not audio.filename:
         raise HTTPException(status_code=400, detail="File rỗng")
 
-    try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            ext = os.path.splitext(audio.filename)[1].lower() or ".webm"
-            input_temp_path = os.path.join(temp_dir, f'raw_input{ext}')
-            wav_temp_path = os.path.join(temp_dir, 'converted_input.wav')
-            output_temp_path = os.path.join(temp_dir, 'clean_output.wav')
+    task_id = str(uuid.uuid4())
+    temp_dir = tempfile.mkdtemp()
+    ext = os.path.splitext(audio.filename)[1].lower() or ".webm"
+    input_temp_path = os.path.join(temp_dir, f'raw_input_{task_id}{ext}')
+    wav_temp_path = os.path.join(temp_dir, f'converted_{task_id}.wav')
+    output_temp_path = os.path.join(temp_dir, f'clean_{task_id}.wav')
 
-            with open(input_temp_path, "wb") as buffer:
-                shutil.copyfileobj(audio.file, buffer)
-            
-            print("🔄 Chuyển định dạng WebM -> WAV...", flush=True)
-            audio_segment = AudioSegment.from_file(input_temp_path)
-            audio_segment.export(wav_temp_path, format="wav")
-            
-            del audio_segment
-            gc.collect()
+    with open(input_temp_path, "wb") as buffer:
+        shutil.copyfileobj(audio.file, buffer)
 
-            print("🎙️ Đang xử lý AI...", flush=True)
-            process_audio(wav_temp_path, output_temp_path)
-            print("✨ Xử lý thành công!", flush=True)
-            
-            with open(output_temp_path, 'rb') as f:
-                return_data = io.BytesIO(f.read())
+    tasks_db[task_id] = {"status": "processing"}
+    background_tasks.add_task(run_ai_background, task_id, input_temp_path, wav_temp_path, output_temp_path)
 
-        return_data.seek(0)
-        return StreamingResponse(
-            return_data,
-            media_type='audio/wav',
-            headers={"Content-Disposition": "attachment; filename=clean_audio.wav"}
-        )
+    return {"task_id": task_id, "status": "processing"}
 
-    except Exception as e:
-        import traceback
-        print(f"❌ Lỗi: {e}", flush=True)
-        print(traceback.format_exc(), flush=True)
-        raise HTTPException(status_code=500, detail=str(e))
+@app.get("/api/task-status/{task_id}")
+def get_task_status(task_id: str):
+    task = tasks_db.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Không tìm thấy task này")
+    return {"task_id": task_id, "status": task["status"]}
+
+@app.get("/api/download/{task_id}")
+def download_result(task_id: str):
+    task = tasks_db.get(task_id)
+    if not task or task["status"] != "completed":
+        raise HTTPException(status_code=400, detail="File chưa sẵn sàng")
+    
+    file_path = task["result_file"]
+    
+    with open(file_path, 'rb') as f:
+        return_data = io.BytesIO(f.read())
+    return_data.seek(0)
+    
+    del tasks_db[task_id]
+    shutil.rmtree(os.path.dirname(file_path), ignore_errors=True)
+    gc.collect()
+
+    return StreamingResponse(
+        return_data,
+        media_type='audio/wav',
+        headers={"Content-Disposition": f"attachment; filename=clean_{task_id}.wav"}
+    )
