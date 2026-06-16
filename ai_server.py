@@ -9,7 +9,7 @@ import threading
 import uuid
 
 # ==========================================
-# 1. TỐI ƯU HÓA PHẦN CỨNG HỆ THỐNG
+# 1. TỐI ƯU HÓA HỆ ĐIỀU HÀNH & TENSORFLOW
 # ==========================================
 os.environ['MALLOC_ARENA_MAX'] = '1'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -35,34 +35,34 @@ app.add_middleware(
 )
 
 # ==========================================
-# 2. TẢI MÔ HÌNH TOÀN CỤC VÀO RAM
+# 2. TẢI MÔ HÌNH TOÀN CỤC VÀ KHÓA LUỒNG
 # ==========================================
 import tensorflow as tf
+
+# Ép TensorFlow cấm tạo thêm luồng ẩn, chỉ dùng 1 luồng duy nhất để không chiếm đoạt CPU
+tf.config.threading.set_intra_op_parallelism_threads(1)
+tf.config.threading.set_inter_op_parallelism_threads(1)
 tf.config.set_visible_devices([], 'GPU')
 
 MODEL_PATH = os.path.join(os.path.dirname(__file__), 'model', 'denoise_softmask_best.h5')
 try:
     print("⏳ Đang tải mô hình AI vào RAM...", flush=True)
     ai_model = tf.keras.models.load_model(MODEL_PATH, compile=False)
-    # Khởi động nóng mô hình
     ai_model.predict(np.zeros((1, 128, 128, 1), dtype=np.float32), verbose=0)
     print("✅ Mô hình đã sẵn sàng!", flush=True)
 except Exception as e:
     print(f"❌ Lỗi tải mô hình: {e}", flush=True)
     ai_model = None
 
-# ==========================================
-# 3. CƠ CHẾ BẤT ĐỒNG BỘ POLLING & MUTEX LOCK
-# ==========================================
 tasks_db = {}
-
-# Khóa Mutex đảm bảo chỉ xử lý 1 file tại 1 thời điểm để chống tràn RAM
 ai_processing_lock = threading.Lock()
 
+# ==========================================
+# 3. HÀM XỬ LÝ ÂM THANH CỐT LÕI (BẢN VÁ CPU STARVATION)
+# ==========================================
 def process_audio(input_path, output_path, task_id):
     y, sr = librosa.load(input_path, sr=16000)
     
-    # Chia nhỏ file thành từng khối 5 giây
     SEGMENT_SECONDS = 5
     segment_samples = SEGMENT_SECONDS * sr
     y_clean_full = [] 
@@ -77,7 +77,6 @@ def process_audio(input_path, output_path, task_id):
         end_sample = min(start_sample + segment_samples, len(y))
         y_segment = y[start_sample:end_sample]
         
-        # Tiền xử lý (STFT)
         stft = librosa.stft(y_segment, n_fft=254, hop_length=128)
         magnitude = np.abs(stft)
         phase = np.exp(1.j * np.angle(stft))
@@ -118,22 +117,30 @@ def process_audio(input_path, output_path, task_id):
         del chunks, norm_spectrogram, log_spectrogram, magnitude
         gc.collect()
 
-        # Suy luận AI (Inference)
         X_cleaned = np.zeros((num_chunks, 128, 128), dtype=np.float32)
-        batch_size = 4 
+        # Giảm batch_size xuống 2 để AI nhai nhanh, nhả CPU lẹ
+        batch_size = 2 
 
+        # --- LÕI SÂU NHẤT CỦA AI ---
         for i in range(0, num_chunks, batch_size):
             end_idx = min(i + batch_size, num_chunks)
             batch = tf.convert_to_tensor(X_input[i:end_idx], dtype=tf.float32)
+            
+            # Tính toán khốc liệt bằng C++ Backend
             pred = ai_model(batch, training=False).numpy()
             X_cleaned[i:end_idx] = np.squeeze(pred, axis=-1)
+            
             del batch, pred
             gc.collect()
+
+            # --- CÚ CHỐT GIẢI CỨU CPU STARVATION ---
+            # Ép luồng AI ngủ 0.05 giây SAU MỖI BATCH NHỎ ĐỂ FASTAPI CÓ THỂ THỞ VÀ TRẢ LỜI POLLING
+            time.sleep(0.05) 
+        # ---------------------------
 
         del X_input
         gc.collect()
 
-        # Hậu xử lý (Tái tạo âm thanh)
         cleaned_padded = np.zeros((freq_bins, padded_time_frames))
         overlap_count = np.zeros((freq_bins, padded_time_frames))
 
@@ -152,14 +159,9 @@ def process_audio(input_path, output_path, task_id):
         y_clean_segment = librosa.istft(cleaned_stft, hop_length=128, length=len(y_segment))
         y_clean_full.append(y_clean_segment)
 
-        # Dọn rác bộ nhớ sau mỗi 5s
         del stft, phase, cleaned_padded, overlap_count, cleaned_spectrogram_norm, cleaned_log_spectrogram, cleaned_magnitude, cleaned_stft, X_cleaned, y_clean_segment, y_segment
         gc.collect()
 
-        # Giải cứu CPU Starvation: Ngủ 0.5s để hệ thống trả lời Polling
-        time.sleep(0.5)
-
-    # Nối các mảnh 5s lại thành audio hoàn chỉnh
     y_final = np.concatenate(y_clean_full)
     
     max_amplitude = np.max(np.abs(y_final))
@@ -176,7 +178,6 @@ def run_ai_background(task_id: str, input_path: str, wav_temp_path: str, output_
     try:
         print(f"[{task_id}] ⏳ Đang xếp hàng chờ đến lượt xử lý...", flush=True)
         
-        # Chỉ cho phép 1 luồng đi qua, các luồng khác sẽ đứng đợi ở đây
         with ai_processing_lock:
             print(f"[{task_id}] 🟢 Đã đến lượt! Bắt đầu xử lý...", flush=True)
             
@@ -218,15 +219,12 @@ def clean_audio_api(background_tasks: BackgroundTasks, audio: UploadFile = File(
     wav_temp_path = os.path.join(temp_dir, f'converted_{task_id}.wav')
     output_temp_path = os.path.join(temp_dir, f'clean_{task_id}.wav')
 
-    # Lưu file âm thanh gốc
     with open(input_temp_path, "wb") as buffer:
         shutil.copyfileobj(audio.file, buffer)
 
-    # Đăng ký nhiệm vụ và ném vào luồng nền
     tasks_db[task_id] = {"status": "processing"}
     background_tasks.add_task(run_ai_background, task_id, input_temp_path, wav_temp_path, output_temp_path)
 
-    # Trả về mã số vé ngay lập tức
     return {"task_id": task_id, "status": "processing"}
 
 @app.get("/api/task-status/{task_id}")
@@ -244,12 +242,10 @@ def download_result(task_id: str):
     
     file_path = task["result_file"]
     
-    # Nạp file sạch vào RAM
     with open(file_path, 'rb') as f:
         return_data = io.BytesIO(f.read())
     return_data.seek(0)
     
-    # Dọn dẹp Database và Xóa file rác trên ổ cứng
     del tasks_db[task_id]
     shutil.rmtree(os.path.dirname(file_path), ignore_errors=True)
     gc.collect()
