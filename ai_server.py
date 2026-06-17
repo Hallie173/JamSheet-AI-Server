@@ -39,7 +39,6 @@ app.add_middleware(
 # ==========================================
 import tensorflow as tf
 
-# Ép TensorFlow cấm tạo thêm luồng ẩn, chỉ dùng 1 luồng duy nhất để không chiếm đoạt CPU
 tf.config.threading.set_intra_op_parallelism_threads(1)
 tf.config.threading.set_inter_op_parallelism_threads(1)
 tf.config.set_visible_devices([], 'GPU')
@@ -58,7 +57,7 @@ tasks_db = {}
 ai_processing_lock = threading.Lock()
 
 # ==========================================
-# 3. HÀM XỬ LÝ ÂM THANH CỐT LÕI (BẢN VÁ CPU STARVATION)
+# 3. HÀM XỬ LÝ ÂM THANH CỐT LÕI
 # ==========================================
 def process_audio(input_path, output_path, task_id):
     y, sr = librosa.load(input_path, sr=16000)
@@ -71,6 +70,12 @@ def process_audio(input_path, output_path, task_id):
     current_segment = 0
 
     for start_sample in range(0, len(y), segment_samples):
+        # ---> TRẠM KIỂM SOÁT HỦY ĐƠN: Kiểm tra xem user còn đợi không <---
+        if tasks_db.get(task_id, {}).get("status") == "cancelled":
+            print(f"[{task_id}] 🛑 Phát hiện lệnh HỦY! Dừng xử lý ngay lập tức.", flush=True)
+            gc.collect()
+            return False # Trả về False để báo hiệu chưa làm xong
+
         current_segment += 1
         print(f"[{task_id}] ⚙️ Đang xử lý đoạn {current_segment}/{total_segments}...", flush=True)
 
@@ -118,25 +123,19 @@ def process_audio(input_path, output_path, task_id):
         gc.collect()
 
         X_cleaned = np.zeros((num_chunks, 128, 128), dtype=np.float32)
-        # Giảm batch_size xuống 2 để AI nhai nhanh, nhả CPU lẹ
         batch_size = 2 
 
-        # --- LÕI SÂU NHẤT CỦA AI ---
         for i in range(0, num_chunks, batch_size):
             end_idx = min(i + batch_size, num_chunks)
             batch = tf.convert_to_tensor(X_input[i:end_idx], dtype=tf.float32)
             
-            # Tính toán khốc liệt bằng C++ Backend
             pred = ai_model(batch, training=False).numpy()
             X_cleaned[i:end_idx] = np.squeeze(pred, axis=-1)
             
             del batch, pred
             gc.collect()
 
-            # --- CÚ CHỐT GIẢI CỨU CPU STARVATION ---
-            # Ép luồng AI ngủ 0.05 giây SAU MỖI BATCH NHỎ ĐỂ FASTAPI CÓ THỂ THỞ VÀ TRẢ LỜI POLLING
             time.sleep(0.05) 
-        # ---------------------------
 
         del X_input
         gc.collect()
@@ -172,12 +171,22 @@ def process_audio(input_path, output_path, task_id):
 
     del y, y_clean_full, y_final
     gc.collect()
+    
+    return True # Báo hiệu đã làm xong trọn vẹn
+
 
 def run_ai_background(task_id: str, input_path: str, wav_temp_path: str, output_temp_path: str):
     try:
         print(f"[{task_id}] ⏳ Đang xếp hàng chờ đến lượt xử lý...", flush=True)
         
         with ai_processing_lock:
+            # Kiểm tra xem user có hủy lệnh trong lúc đang đứng xếp hàng không
+            if tasks_db.get(task_id, {}).get("status") == "cancelled":
+                print(f"[{task_id}] 🚫 Bị hủy khi đang xếp hàng. Dọn rác và bỏ qua.", flush=True)
+                shutil.rmtree(os.path.dirname(input_temp_path), ignore_errors=True)
+                if task_id in tasks_db: del tasks_db[task_id]
+                return
+
             print(f"[{task_id}] 🟢 Đã đến lượt! Bắt đầu xử lý...", flush=True)
             
             audio_segment = AudioSegment.from_file(input_path)
@@ -185,14 +194,19 @@ def run_ai_background(task_id: str, input_path: str, wav_temp_path: str, output_
             del audio_segment
             gc.collect()
 
-            process_audio(wav_temp_path, output_temp_path, task_id)
+            # Gọi hàm xử lý và nhận kết quả
+            is_finished = process_audio(wav_temp_path, output_temp_path, task_id)
             
-            tasks_db[task_id]["status"] = "completed"
-            tasks_db[task_id]["result_file"] = output_temp_path
+            if is_finished:
+                tasks_db[task_id]["status"] = "completed"
+                tasks_db[task_id]["result_file"] = output_temp_path
+                print(f"[{task_id}] ✨ Đã hoàn thành! Mở khóa cho người tiếp theo.", flush=True)
+            else:
+                # Nếu bị hủy giữa chừng (is_finished = False)
+                if task_id in tasks_db: del tasks_db[task_id]
+                shutil.rmtree(os.path.dirname(input_temp_path), ignore_errors=True)
+                print(f"[{task_id}] 🧹 Đã dọn dẹp sạch sẽ do bị hủy. Mở khóa cho người tiếp theo.", flush=True)
             
-            print(f"[{task_id}] ✨ Đã hoàn thành! Mở khóa cho người tiếp theo.", flush=True)
-            
-            # ---> BẢN VÁ: ÉP SERVER NGHỈ 3 GIÂY ĐỂ HỆ ĐIỀU HÀNH DỌN RAM TRƯỚC KHI LÀM TASK MỚI <---
             time.sleep(3)
             gc.collect()
             
@@ -201,12 +215,10 @@ def run_ai_background(task_id: str, input_path: str, wav_temp_path: str, output_
         print(f"[{task_id}] ❌ Lỗi: {e}", flush=True)
         tasks_db[task_id] = {"status": "failed", "error": str(e)}
 
-# Thêm hàm dọn rác tự động
 def cleanup_abandoned_tasks():
     current_time = time.time()
     expired_tasks = []
     for tid, tinfo in tasks_db.items():
-        # Xóa các task đã tồn tại quá 10 phút (600 giây) mà không ai tải về
         if current_time - tinfo.get("timestamp", current_time) > 600:
             expired_tasks.append(tid)
     
@@ -217,32 +229,6 @@ def cleanup_abandoned_tasks():
         del tasks_db[tid]
         print(f"🧹 Đã dọn dẹp task rác mồ côi: {tid}", flush=True)
     gc.collect()
-
-@app.post("/api/clean-audio")
-def clean_audio_api(background_tasks: BackgroundTasks, audio: UploadFile = File(...)):
-    if not ai_model:
-        raise HTTPException(status_code=500, detail="Mô hình AI chưa sẵn sàng")
-    if not audio.filename:
-        raise HTTPException(status_code=400, detail="File rỗng")
-
-    # Gọi hàm dọn rác trước khi nhận task mới
-    cleanup_abandoned_tasks()
-
-    task_id = str(uuid.uuid4())
-    temp_dir = tempfile.mkdtemp()
-    ext = os.path.splitext(audio.filename)[1].lower() or ".webm"
-    input_temp_path = os.path.join(temp_dir, f'raw_input_{task_id}{ext}')
-    wav_temp_path = os.path.join(temp_dir, f'converted_{task_id}.wav')
-    output_temp_path = os.path.join(temp_dir, f'clean_{task_id}.wav')
-
-    with open(input_temp_path, "wb") as buffer:
-        shutil.copyfileobj(audio.file, buffer)
-
-    # Đánh dấu thêm thời gian tạo để biết đường dọn rác
-    tasks_db[task_id] = {"status": "processing", "timestamp": time.time()}
-    background_tasks.add_task(run_ai_background, task_id, input_temp_path, wav_temp_path, output_temp_path)
-
-    return {"task_id": task_id, "status": "processing"}
 
 # ==========================================
 # 4. API ENDPOINTS
@@ -258,6 +244,8 @@ def clean_audio_api(background_tasks: BackgroundTasks, audio: UploadFile = File(
     if not audio.filename:
         raise HTTPException(status_code=400, detail="File rỗng")
 
+    cleanup_abandoned_tasks()
+
     task_id = str(uuid.uuid4())
     temp_dir = tempfile.mkdtemp()
     ext = os.path.splitext(audio.filename)[1].lower() or ".webm"
@@ -268,10 +256,19 @@ def clean_audio_api(background_tasks: BackgroundTasks, audio: UploadFile = File(
     with open(input_temp_path, "wb") as buffer:
         shutil.copyfileobj(audio.file, buffer)
 
-    tasks_db[task_id] = {"status": "processing"}
+    tasks_db[task_id] = {"status": "processing", "timestamp": time.time()}
     background_tasks.add_task(run_ai_background, task_id, input_temp_path, wav_temp_path, output_temp_path)
 
     return {"task_id": task_id, "status": "processing"}
+
+# BỔ SUNG API NHẬN LỆNH HỦY TỪ FRONTEND
+@app.delete("/api/tasks/{task_id}")
+def cancel_task(task_id: str):
+    if task_id in tasks_db:
+        # Nếu task đang nằm chờ hoặc đang xử lý, đổi cờ thành cancelled
+        tasks_db[task_id]["status"] = "cancelled"
+        return {"message": "Đã gửi lệnh hủy task", "task_id": task_id}
+    return {"message": "Không tìm thấy task"}
 
 @app.get("/api/task-status/{task_id}")
 def get_task_status(task_id: str):
