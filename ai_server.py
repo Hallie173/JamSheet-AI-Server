@@ -173,7 +173,6 @@ def process_audio(input_path, output_path, task_id):
     del y, y_clean_full, y_final
     gc.collect()
 
-
 def run_ai_background(task_id: str, input_path: str, wav_temp_path: str, output_temp_path: str):
     try:
         print(f"[{task_id}] ⏳ Đang xếp hàng chờ đến lượt xử lý...", flush=True)
@@ -193,10 +192,57 @@ def run_ai_background(task_id: str, input_path: str, wav_temp_path: str, output_
             
             print(f"[{task_id}] ✨ Đã hoàn thành! Mở khóa cho người tiếp theo.", flush=True)
             
+            # ---> BẢN VÁ: ÉP SERVER NGHỈ 3 GIÂY ĐỂ HỆ ĐIỀU HÀNH DỌN RAM TRƯỚC KHI LÀM TASK MỚI <---
+            time.sleep(3)
+            gc.collect()
+            
     except Exception as e:
         import traceback
         print(f"[{task_id}] ❌ Lỗi: {e}", flush=True)
         tasks_db[task_id] = {"status": "failed", "error": str(e)}
+
+# Thêm hàm dọn rác tự động
+def cleanup_abandoned_tasks():
+    current_time = time.time()
+    expired_tasks = []
+    for tid, tinfo in tasks_db.items():
+        # Xóa các task đã tồn tại quá 10 phút (600 giây) mà không ai tải về
+        if current_time - tinfo.get("timestamp", current_time) > 600:
+            expired_tasks.append(tid)
+    
+    for tid in expired_tasks:
+        tinfo = tasks_db[tid]
+        if tinfo.get("result_file"):
+            shutil.rmtree(os.path.dirname(tinfo["result_file"]), ignore_errors=True)
+        del tasks_db[tid]
+        print(f"🧹 Đã dọn dẹp task rác mồ côi: {tid}", flush=True)
+    gc.collect()
+
+@app.post("/api/clean-audio")
+def clean_audio_api(background_tasks: BackgroundTasks, audio: UploadFile = File(...)):
+    if not ai_model:
+        raise HTTPException(status_code=500, detail="Mô hình AI chưa sẵn sàng")
+    if not audio.filename:
+        raise HTTPException(status_code=400, detail="File rỗng")
+
+    # Gọi hàm dọn rác trước khi nhận task mới
+    cleanup_abandoned_tasks()
+
+    task_id = str(uuid.uuid4())
+    temp_dir = tempfile.mkdtemp()
+    ext = os.path.splitext(audio.filename)[1].lower() or ".webm"
+    input_temp_path = os.path.join(temp_dir, f'raw_input_{task_id}{ext}')
+    wav_temp_path = os.path.join(temp_dir, f'converted_{task_id}.wav')
+    output_temp_path = os.path.join(temp_dir, f'clean_{task_id}.wav')
+
+    with open(input_temp_path, "wb") as buffer:
+        shutil.copyfileobj(audio.file, buffer)
+
+    # Đánh dấu thêm thời gian tạo để biết đường dọn rác
+    tasks_db[task_id] = {"status": "processing", "timestamp": time.time()}
+    background_tasks.add_task(run_ai_background, task_id, input_temp_path, wav_temp_path, output_temp_path)
+
+    return {"task_id": task_id, "status": "processing"}
 
 # ==========================================
 # 4. API ENDPOINTS
